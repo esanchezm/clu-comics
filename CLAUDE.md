@@ -18,7 +18,15 @@ Production runs `gunicorn -w 1 --threads 8 --timeout 120 app:app` (see Dockerfil
 ## Architecture
 
 ### Core Application Flow
-- **`api.py`**: Creates the Flask app instance and handles download queue/remote downloads
+- **`api.py`**: Creates the Flask app instance and handles download queue/remote downloads.
+  The `/download*` family is anonymous only in implicit-owner mode; once login
+  is required it needs a session or an API token (`_gate_download_api` in
+  `routes/auth.py`). Every URL it fetches — the link, each resolver hop, the
+  resolved URL and every in-session redirect — goes through
+  `core.download_utils.assert_public_url`, and the owner's custom headers
+  reach only the GetComics hosts (`request_headers_for`). Pinned by
+  `tests/unit/test_download_url_guard.py` and
+  `tests/unit/test_download_endpoint_hardening.py`.
 - **`app.py`**: Main application - imports Flask app from `api.py`, registers blueprints, defines all routes and API endpoints
 - **`monitor.py`**: Standalone file watcher for folder monitoring. It runs as a child process of the gunicorn worker while the `monitor_enabled` setting is on, and `core/monitor_supervisor.py` starts and stops it live. The `MONITOR` env var is only imported once. See `.claude/rules/watch-pipeline.md`.
 

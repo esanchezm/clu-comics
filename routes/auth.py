@@ -30,6 +30,9 @@ from core.auth import (
     current_user,
     is_login_required,
     load_current_user,
+    required_role_for_request,
+    resolve_optional_bearer_user,
+    role_at_least,
 )
 from helpers.paging import PAGE_SIZES, DEFAULT_PER_PAGE, COLLECTION_DEFAULT_PER_PAGE
 from core.database import (
@@ -168,16 +171,70 @@ def _clu_default_per_page(kind=None):
     return COLLECTION_DEFAULT_PER_PAGE if kind == "collection" else DEFAULT_PER_PAGE
 
 
-# Download endpoints (api.py) are auth-free by design so the browser extension
-# — which sends no Flask session cookie — can queue downloads. "/download"
-# prefix-matches /download, /download_status, /download_status_all and
-# /download_summary; the management endpoints are listed explicitly.
 _EXEMPT_PREFIXES = (
     "/login", "/logout", "/static/", "/opds", "/api/insights", "/api/v1/",
+)
+
+# The download endpoints (api.py) the browser extension calls. The extension
+# sends no session cookie, so these are anonymous in implicit-owner mode
+# (single-user installs keep working untouched). Once login is required they
+# need a session (the Status page) or an API token in the extension's Custom
+# Headers, with the role required_role_for_request implies: clerk to queue or
+# manage, reader to read status. "/download" prefix-matches /download,
+# /download_status, /download_status_all and /download_summary -- and would
+# match a future /downloads page too, so switch to exact paths if one appears.
+_DOWNLOAD_API_PREFIXES = (
     "/download",
     "/cancel_download", "/retry_download", "/dismiss_download",
     "/clear_downloads", "/clear_failed_downloads",
 )
+
+_TOKEN_HINT = (
+    'Add {"Authorization": "Bearer <API token>"} to the extension\'s '
+    "Custom Headers"
+)
+
+
+def _download_api_unauthorized(hint=None):
+    body = {"error": "unauthorized"}
+    if hint:
+        body["hint"] = hint
+    resp = jsonify(body)
+    resp.status_code = 401
+    resp.headers["WWW-Authenticate"] = "Bearer"
+    return resp
+
+
+def _gate_download_api():
+    """Gate the /download family. Always JSON, never a redirect: the
+    extension's fetch would follow a redirect to /login and read a 200."""
+    # A CORS preflight carries no credentials; GET /download is a help page.
+    if request.method == "OPTIONS":
+        return None
+    if request.path == "/download" and request.method == "GET":
+        return None
+
+    status, token_user = resolve_optional_bearer_user(
+        request.headers.get("Authorization", ""))
+    # A wrong token is an error in every mode, so a misconfigured extension
+    # finds out instead of being served as the owner.
+    if status == "invalid":
+        return _download_api_unauthorized()
+
+    if not is_login_required():
+        load_current_user()
+        return None
+
+    if status == "ok":
+        g.current_user = token_user
+        user = token_user
+    else:
+        user = load_current_user()
+    if user is None:
+        return _download_api_unauthorized(_TOKEN_HINT)
+    if not role_at_least(user, required_role_for_request()):
+        return jsonify({"error": "forbidden"}), 403
+    return None
 
 
 @auth_bp.before_app_request
@@ -188,6 +245,8 @@ def require_login():
     Redirects to /login only when login is required and no user is
     authenticated.
     """
+    if request.path.startswith(_DOWNLOAD_API_PREFIXES):
+        return _gate_download_api()
     if any(request.path.startswith(p) for p in _EXEMPT_PREFIXES):
         return None
 

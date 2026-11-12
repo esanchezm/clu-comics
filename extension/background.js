@@ -39,6 +39,9 @@ function sendLinkToApi(linkUrl, sendResponse) {
       body: JSON.stringify({ link: linkUrl })
     })
       .then(response => {
+        if (response.status === 401 || response.status === 403) {
+          throw new Error("CLU rejected the request (" + response.status + "). Add an API token under Custom Headers.");
+        }
         if (!response.ok) throw new Error("Status: " + response.status);
         if (sendResponse) sendResponse({ success: true });
       })

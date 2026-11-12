@@ -76,6 +76,11 @@
   <p>
     <code>{"CF-Access-Client-Id": "your-client-id-here.access",<br/>"CF-Access-Client-Secret": "your-secret-here"}</code>
   </p>
+  <p>When CLU has more than one user account (or uses the <code>CLU_USERNAME</code> login), it also needs an
+    API token. Create one in CLU from your account menu (API Tokens) and add it here:</p>
+  <p>
+    <code>{"Authorization": "Bearer your-api-token"}</code>
+  </p>
   <p><textarea id="headers" placeholder='custom headers here'></textarea></p>
 
   <button id="save">Save</button>

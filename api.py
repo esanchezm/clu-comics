@@ -5,10 +5,9 @@ import os
 import logging
 import requests
 from requests.exceptions import ChunkedEncodingError, ConnectionError, RequestException
-from urllib.parse import urlparse, unquote, urljoin
+from urllib.parse import urlparse, unquote
 import uuid
 import re
-import json
 import shutil
 import tempfile
 from pathlib import Path
@@ -88,6 +87,16 @@ from core.download_utils import (
     FULL_POST_PROCESS,
     MAX_AUTO_RETRIES,
     RETRY_PENDING,
+    GETCOMICS_HOSTS,
+    UnsafeURLError,
+    assert_public_url,
+    fetch_url,
+    harden_session,
+    is_policy_refusal,
+    sensitive_custom_headers,
+    parse_download_request,
+    request_headers_for,
+    url_host_is,
 )
 
 
@@ -181,8 +190,6 @@ def _schedule_auto_retry(task, last_error):
 
 # Setup the download directory from config.
 watch = get_watch_dir() or "/downloads/temp"
-from core.database import get_user_preference
-custom_headers_str = get_user_preference("custom_headers", "")
 
 # Import-time bootstrap only -- WATCH is editable at runtime from Settings, so
 # every download must resolve it through _download_dir() instead of this constant.
@@ -217,38 +224,9 @@ def _download_dir():
             return DOWNLOAD_DIR
     return resolved or DOWNLOAD_DIR
 
-# Default headers for HTTP requests.
-default_headers = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/112.0.0.0 Safari/537.36"
-    )
-}
-
-if custom_headers_str:
-    try:
-        custom_headers = json.loads(custom_headers_str)
-        if isinstance(custom_headers, dict):
-            custom_headers = {k.strip(): v.strip() for k, v in custom_headers.items()}
-            default_headers.update(custom_headers)
-            monitor_logger.info("Custom headers from settings applied.")
-        else:
-            monitor_logger.warning("Custom headers from settings are not a valid dictionary. Ignoring.")
-    except Exception as e:
-        monitor_logger.warning(f"Failed to parse custom headers: {e}. Ignoring.")
-
-headers = default_headers
-
-# Basic headers for internal downloads (no custom headers required)
-# Used when downloads are initiated from within the app (Pull List, Weekly Packs)
-basic_headers = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/112.0.0.0 Safari/537.36"
-    )
-}
+# Request headers are built per URL by core.download_utils.request_headers_for:
+# the owner's custom_headers setting is read per call and sent only to the
+# GetComics hosts, never to whatever host a link or redirect names.
 
 def _make_gc_scraper():
     """Build a fresh cloudscraper session for getcomics.org.
@@ -286,7 +264,7 @@ CORS(app, resources={r"/*": {"origins": "*"}})
 # -------------------------------
 # URL Resolver
 # -------------------------------
-def resolve_final_url(url: str, *, hdrs=headers, max_hops: int = 6) -> str:
+def resolve_final_url(url: str, *, internal: bool = False, max_hops: int = 6) -> str:
     """
     Follow every ordinary 3xx redirect **and** the HTML *meta-refresh* pages
     that GetComics sometimes serves, stopping once we reach the real file
@@ -298,12 +276,17 @@ def resolve_final_url(url: str, *, hdrs=headers, max_hops: int = 6) -> str:
     resolution failing here is not cosmetic: it leaves a tokenized /dls/ URL
     that no provider branch matches, so the caller would mislabel and misroute
     the download.
+
+    Every hop is checked with assert_public_url before it is requested, and
+    UnsafeURLError propagates: it must not be read as "unresolvable, return
+    the URL as-is" by the handlers below.
     """
     global gc_scraper
 
     current = url
     for _ in range(max_hops):
-        is_gc = 'getcomics.org' in current.lower()
+        assert_public_url(current)
+        is_gc = url_host_is(current, "getcomics.org")
         r = None
         cleared = False
 
@@ -327,12 +310,13 @@ def resolve_final_url(url: str, *, hdrs=headers, max_hops: int = 6) -> str:
                         gc_scraper = replace_session(gc_scraper, _make_gc_scraper)
                         continue
                 else:
+                    hop_headers = request_headers_for(current, internal=internal)
                     try:
-                        r = requests.head(current, headers=hdrs,
+                        r = requests.head(current, headers=hop_headers,
                                           allow_redirects=False, timeout=15)
                     except requests.RequestException:
                         # some hosts block HEAD → fall back to a very small GET
-                        r = requests.get(current, headers=hdrs, stream=True,
+                        r = requests.get(current, headers=hop_headers, stream=True,
                                          allow_redirects=False, timeout=15)
                 break
             except Exception as e:
@@ -351,7 +335,7 @@ def resolve_final_url(url: str, *, hdrs=headers, max_hops: int = 6) -> str:
 
         # Ordinary HTTP 3xx
         if 300 <= r.status_code < 400 and 'location' in r.headers:
-            current = urljoin(current, r.headers['location'])
+            current = fetch_url(current, r.headers['location'])
             continue
         # Meta-refresh (GetComics' /dlds pages). Skip on a Cloudflare
         # interstitial, whose markup can carry a bogus url= we'd chase.
@@ -360,7 +344,7 @@ def resolve_final_url(url: str, *, hdrs=headers, max_hops: int = 6) -> str:
                 b'<meta' in r.content[:2048]):
             m = re.search(br'url=([^">]+)', r.content[:2048], flags=re.I)
             if m:
-                current = urljoin(current, m.group(1).decode().strip())
+                current = fetch_url(current, m.group(1).decode().strip())
                 continue
         if _is_cloudflare_challenge(r):
             if cleared:
@@ -458,10 +442,6 @@ def process_download(task):
     # tokenized /dls/ link) lets the browser establish the session/referrer.
     source_page_url = task.get('page_url')
 
-    # Use basic headers for internal downloads (Pull List, Weekly Packs, UI searches)
-    # Use full headers (with custom_headers_str) for external downloads (browser extension)
-    use_headers = basic_headers if internal else headers
-
     # If cancelled while queued, don't start at all
     if is_cancel_requested(download_id):
         mark_cancelled(download_id)
@@ -508,11 +488,14 @@ def process_download(task):
 
             # Skip URL resolution for known provider domains — their download
             # functions handle URL construction internally
+            # Scraped links can carry raw spaces; check what requests will fetch.
+            try_url = fetch_url(try_url)
+            assert_public_url(try_url)
             _SKIP_RESOLVE_DOMAINS = ('pixeldrain.com', 'mega.nz', 'mega.co.nz', 'comicbookplus.com', 'comicfiles.ru')
-            if any(domain in try_url.lower() for domain in _SKIP_RESOLVE_DOMAINS):
+            if url_host_is(try_url, *_SKIP_RESOLVE_DOMAINS):
                 final_url = try_url
             else:
-                final_url = resolve_final_url(try_url, hdrs=use_headers)
+                final_url = resolve_final_url(try_url, internal=internal)
             monitor_logger.info(f"Resolved → {final_url} (internal={internal})")
 
             # getcomics wraps every provider's button in an indistinguishable
@@ -530,16 +513,19 @@ def process_download(task):
             # sniffing the resolved URL when no key came with the task.
             download_progress[download_id]['provider'] = provider_label(provider_name, final_url)
 
-            if "pixeldrain.com" in final_url:
+            assert_public_url(final_url)
+            # Custom headers are attached only when final_url is a GetComics host.
+            use_headers = request_headers_for(final_url, internal=internal)
+            if url_host_is(final_url, "pixeldrain.com"):
                 monitor_logger.debug(f"Routing to: download_pixeldrain")
                 file_path = download_pixeldrain(final_url, download_id, dest_filename, hdrs=use_headers)
-            elif "comicbookplus.com" in final_url:
+            elif url_host_is(final_url, "comicbookplus.com"):
                 monitor_logger.debug(f"Routing to: download_comicbookplus")
                 file_path = download_comicbookplus(final_url, download_id, dest_filename, hdrs=use_headers)
-            elif "comicfiles.ru" in final_url:              # GetComics' direct host
+            elif url_host_is(final_url, "comicfiles.ru"):   # GetComics' direct host
                 monitor_logger.debug(f"Routing to: download_getcomics (comicfiles.ru)")
                 file_path = download_getcomics(final_url, download_id, hdrs=use_headers, source_url=(source_page_url or try_url))
-            elif "mega.nz" in final_url or "mega.co.nz" in final_url:  # MEGA
+            elif url_host_is(final_url, "mega.nz", "mega.co.nz"):  # MEGA
                 monitor_logger.debug(f"Routing to: download_mega")
                 file_path = download_mega(final_url, download_id, dest_filename, hdrs=use_headers)
             else:                                           # fall-back
@@ -643,6 +629,12 @@ def process_download(task):
 
         except Exception as e:
             last_error = e
+            if isinstance(e, UnsafeURLError) and is_policy_refusal(e):
+                # Refused by the SSRF guard: it will be refused every time, so
+                # the auto-retry gate must not spend its budget on it. Other
+                # mirrors are still tried. A DNS failure is not a refusal.
+                download_progress[download_id]['no_retry'] = True
+                monitor_logger.warning(f"Refused download URL for {download_id}: {e}")
             # Aborting the transfer is how a cancel surfaces from some
             # providers — don't fail over to the next mirror because of it.
             if is_cancel_requested(download_id):
@@ -736,7 +728,7 @@ def download_getcomics(url, download_id, hdrs=None, source_url=None):
     Args:
         url: The (resolved) download URL to fetch
         download_id: Unique identifier for progress tracking
-        hdrs: Optional headers dict. If None, uses global headers (with custom_headers_str)
+        hdrs: Optional headers dict. If None, built by request_headers_for(url)
         source_url: The original getcomics link to surface as the manual-download
             link on a Cloudflare failure (preferably the post page). The resolved
             mirror URL — and even the tokenized /dls/ link — 403 in a browser;
@@ -744,7 +736,7 @@ def download_getcomics(url, download_id, hdrs=None, source_url=None):
             mirrors require. Defaults to ``url``.
     """
     if hdrs is None:
-        hdrs = headers
+        hdrs = request_headers_for(url, internal=False)
 
     retries = 3
     delay = 2  # base delay in seconds
@@ -788,6 +780,9 @@ def download_getcomics(url, download_id, hdrs=None, source_url=None):
     if scraper_ua:
         session.headers["User-Agent"] = scraper_ua
     session.headers["Referer"] = "https://getcomics.org/"
+    # Every redirect is checked, and a custom header never follows one off
+    # the GetComics hosts.
+    harden_session(session, sensitive_headers=sensitive_custom_headers(session.headers))
 
     # The destination name is reserved once and held for every attempt. Taking
     # it per attempt is what let two of the three workers agree on the same
@@ -821,8 +816,12 @@ def download_getcomics(url, download_id, hdrs=None, source_url=None):
                 # One FlareSolverr pass per download: solve, put the clearance
                 # on this session, and retry. Only if another attempt remains --
                 # on the last one, fall through to the manual notice below.
+                # Only GetComics' own hosts: FlareSolverr's browser follows
+                # redirects and runs the page's scripts outside every SSRF
+                # check, and any server can fake a challenge response.
                 if (challenged and not flaresolverr_tried
-                        and attempt < retries - 1):
+                        and attempt < retries - 1
+                        and url_host_is(url, *GETCOMICS_HOSTS)):
                     flaresolverr_tried = True
                     close_quietly(response)
                     if flaresolverr.clear_challenge(url, session, context="download"):
@@ -996,6 +995,8 @@ def download_getcomics(url, download_id, hdrs=None, source_url=None):
         except (ChunkedEncodingError, ConnectionError, IncompleteRead, RequestException, Exception) as e:
             monitor_logger.warning(f"Attempt {attempt + 1} failed with error: {e}")
             last_exception = e
+            if is_policy_refusal(e):
+                break         # refused by the SSRF guard; retrying changes nothing
 
             # Clean up the attempt-specific temp file
             if 'temp_file_path' in locals() and os.path.exists(temp_file_path):
@@ -1043,7 +1044,9 @@ def download_getcomics(url, download_id, hdrs=None, source_url=None):
             else:
                 monitor_logger.debug(f"No leftover temp file to remove: {leftover}")
 
-    raise Exception(f"Download failed for {url}: {last_exception}")
+    # Keep the refusal's type, so process_download skips the auto-retry.
+    error_type = UnsafeURLError if is_policy_refusal(last_exception) else Exception
+    raise error_type(f"Download failed for {url}: {last_exception}")
 
 # -------------------------------
 # Pixeldrain support
@@ -1063,7 +1066,9 @@ def _requests_session() -> requests.Session:
     )
     s.mount("https://", HTTPAdapter(max_retries=retries, pool_connections=32, pool_maxsize=32))
     s.mount("http://",  HTTPAdapter(max_retries=retries, pool_connections=32, pool_maxsize=32))
-    return s
+    # Every redirect is checked. PixelDrain and ComicBookPlus are never sent
+    # the owner's custom headers, so there are none to strip.
+    return harden_session(s)
 
 def _parse_total_from_headers(hdrs, default_size=None):
     # Prefer Content-Range when resuming, else Content-Length
@@ -1093,10 +1098,10 @@ def download_pixeldrain(url: str, download_id: str, dest_name: Optional[str] = N
         url: The PixelDrain URL
         download_id: Unique identifier for progress tracking
         dest_name: Optional destination filename
-        hdrs: Optional headers dict. If None, uses global headers (with custom_headers_str)
+        hdrs: Optional headers dict. If None, built by request_headers_for(url)
     """
     if hdrs is None:
-        hdrs = headers
+        hdrs = request_headers_for(url, internal=False)
 
     file_id = _pd_id(url)
 
@@ -1307,10 +1312,10 @@ def download_comicbookplus(url: str, download_id: str, dest_name: Optional[str] 
         url: The ComicBookPlus download URL
         download_id: Unique identifier for progress tracking
         dest_name: Optional destination filename
-        hdrs: Optional headers dict. If None, uses global headers (with custom_headers_str)
+        hdrs: Optional headers dict. If None, built by request_headers_for(url)
     """
     if hdrs is None:
-        hdrs = headers
+        hdrs = request_headers_for(url, internal=False)
     parsed = urlparse(url)
     query_params = dict(param.split('=') for param in parsed.query.split('&') if '=' in param)
 
@@ -1573,12 +1578,13 @@ def download():
     if request.method == 'OPTIONS':
         return jsonify({}), 200
 
-    data = request.get_json()
+    data = request.get_json(silent=True)
     monitor_logger.info("Received Download Request")
-    if not data or 'link' not in data:
-        return jsonify({'error': 'Missing "link" in request data'}), 400
+    try:
+        url, dest_filename = parse_download_request(data)
+    except ValueError as e:
+        return jsonify({'error': str(e)}), 400
 
-    url = data['link']
     download_id = str(uuid.uuid4())
     download_progress[download_id] = {
          'url': url,
@@ -1593,7 +1599,7 @@ def download():
     task = {
          'download_id': download_id,
          'url': url,
-         'dest_filename': data.get("dest_filename")
+         'dest_filename': dest_filename,
     }
     download_queue.put(task)
     return jsonify({'message': 'Download queued', 'download_id': download_id}), 200

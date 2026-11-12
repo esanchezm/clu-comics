@@ -459,3 +459,65 @@ class TestRemoteNamesCannotLeaveTheDirectory:
         assert calls and all(
             any(k.arg == "dest_path" for k in c.keywords) for c in calls
         ), "download_mega must pass its claimed path as dest_path"
+
+
+class TestNameContainment:
+    """claim_download_path is the one place every downloader's name goes
+    through, so it is where containment holds -- including names the caller
+    already "cleaned" and a symlink planted in WATCH under the candidate name."""
+
+    @pytest.fixture
+    def dirs(self, tmp_path):
+        watch = tmp_path / "watch"
+        outside = tmp_path / "outside"
+        watch.mkdir()
+        outside.mkdir()
+        return watch, outside
+
+    @pytest.mark.parametrize("name", [
+        "../x.cbz",
+        "../../etc/x.cbz",
+        "/etc/x.cbz",
+        "..\\..\\x.cbz",
+        "a/b/c.cbz",
+        __import__("urllib.parse").parse.unquote("..%2Fx.cbz"),
+        "x\x00.cbz",
+        ".hidden.cbz",
+        "...cbz",
+        "x.cbz. ",
+        "",
+        ".",
+        "..",
+    ])
+    def test_every_name_lands_in_the_directory(self, dirs, name):
+        watch, outside = dirs
+        final, claim = claim_download_path(str(watch), name)
+
+        assert os.path.dirname(final) == str(watch)
+        assert os.path.exists(claim) and os.path.dirname(claim) == str(watch)
+        assert not os.path.basename(final).startswith(".")
+        assert list(outside.iterdir()) == []
+        release_download_claim(claim)
+
+    def test_unicode_and_punctuation_survive(self, tmp_path):
+        name = "Batman 001 (2024) (Digital) #1 – Edición.cbz"
+        final, claim = claim_download_path(str(tmp_path), name)
+        assert os.path.basename(final) == name
+        release_download_claim(claim)
+
+    def test_a_long_name_is_capped_and_keeps_its_extension(self, tmp_path):
+        final, claim = claim_download_path(str(tmp_path), "y" * 400 + ".cbz")
+        base = os.path.basename(final)
+        assert base.endswith(".cbz") and len(base.encode()) <= 200
+        release_download_claim(claim)
+
+    def test_a_planted_symlink_is_not_followed(self, dirs):
+        watch, outside = dirs
+        os.symlink(os.path.join("..", "outside", "evil.cbz"), watch / "evil.cbz")
+
+        final, claim = claim_download_path(str(watch), "evil.cbz")
+
+        assert os.path.basename(final) != "evil.cbz"
+        assert os.path.dirname(final) == str(watch)
+        assert list(outside.iterdir()) == []
+        release_download_claim(claim)

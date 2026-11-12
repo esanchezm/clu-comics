@@ -104,6 +104,12 @@ class TestShouldAutoRetry:
         progress["dl-1"]["manual_url"] = "https://getcomics.test/post"
         assert should_auto_retry(progress, "dl-1", 0) is False
 
+    def test_a_refused_url_never_retries(self, progress):
+        """no_retry is set when assert_public_url refused the link or a
+        redirect: it is refused the same way every time."""
+        progress["dl-1"]["no_retry"] = True
+        assert should_auto_retry(progress, "dl-1", 0) is False
+
     def test_tolerates_a_non_dict_progress(self):
         assert should_auto_retry(None, "dl-1", 0) is False
 
@@ -162,6 +168,11 @@ class TestResetForRetry:
         progress["dl-1"]["manual_url"] = "https://getcomics.test/post"
         reset_for_retry(progress, "dl-1")
         assert progress["dl-1"]["manual_url"] is None
+
+    def test_clears_the_refusal_flag(self, progress):
+        progress["dl-1"]["no_retry"] = True
+        reset_for_retry(progress, "dl-1")
+        assert not progress["dl-1"]["no_retry"]
         assert should_auto_retry(progress, "dl-1", 0) is True
 
     def test_keeps_the_url_so_the_download_can_run_again(self, progress):

@@ -256,6 +256,23 @@ def app(db_connection, tmp_path):
             return jsonify({"error": "Failed to get stats"}), 500
         return jsonify(payload)
 
+    # The /download family (api.py, not importable here), so the auth gate in
+    # routes/auth.py is exercised against real rules. Keep in sync with api.py.
+    for rule, endpoint, methods in (
+        ("/download", "download_help", ["GET"]),
+        ("/download", "download", ["POST", "OPTIONS"]),
+        ("/download_status/<download_id>", "download_status", ["GET"]),
+        ("/download_status_all", "download_status_all", ["GET"]),
+        ("/download_summary", "download_summary", ["GET"]),
+        ("/cancel_download/<download_id>", "cancel_download", ["POST"]),
+        ("/retry_download/<download_id>", "retry_download", ["POST"]),
+        ("/dismiss_download/<download_id>", "dismiss_download", ["POST"]),
+        ("/clear_downloads", "clear_downloads", ["POST"]),
+        ("/clear_failed_downloads", "clear_failed_downloads", ["POST"]),
+    ):
+        test_app.add_url_rule(
+            rule, endpoint, lambda **_kw: ("stub", 200), methods=methods)
+
     @test_app.route("/logs")
     def logs_page():
         return "stub", 200

@@ -161,6 +161,16 @@ died with "Temp file not found".
   and resume *our* bytes into its own file. `download_comicbookplus` is the
   opposite case — it always opens `'wb'` — so it deletes the partial and frees
   the name.
+- **The claim is also the containment choke point.** Every name reaching it
+  came from somewhere hostile — a `Content-Disposition`, a URL path, MEGA's
+  attributes, or an anonymous `/download` body — so it runs
+  `safe_download_filename` (last path segment, no control characters, no
+  leading dots, capped length) and refuses any candidate whose realpath is not
+  directly in the directory (a symlink planted under the name). It is
+  deliberately **not** `secure_filename` and **not** the
+  `core/filename_chars.py` map: spaces, parentheses, `#` and Unicode must
+  survive for the matchers, and the renamer applies the char map later. A new
+  downloader must take its name through the claim.
 
 #### The orphan sweep may only delete what stopped growing
 

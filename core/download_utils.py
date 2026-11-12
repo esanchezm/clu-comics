@@ -6,11 +6,19 @@ connection, cloudscraper). Nothing here imports ``api`` or ``core.database`` at
 module scope; the weekly-pack reconciler reaches for both lazily.
 """
 
+import ipaddress
+import json
 import os
 import re
+import socket
 import sys
 import time
 import threading
+import uuid
+from urllib.parse import unquote, urljoin, urlsplit
+
+from requests.utils import requote_uri
+from urllib3.util import parse_url
 
 # Live api.download_progress status -> weekly_packs_history status. 'queued'
 # maps to itself and is filtered out before any write, so a genuinely queued
@@ -313,6 +321,9 @@ def should_auto_retry(progress, download_id, attempt) -> bool:
         return False
     if entry.get('manual_url'):
         return False
+    # A URL the SSRF guard refused (assert_public_url) is refused every time.
+    if entry.get('no_retry'):
+        return False
     return True
 
 
@@ -357,6 +368,7 @@ def reset_for_retry(progress, download_id) -> None:
         'provider': None,
         'manual_url': None,
         'retry_at': None,
+        'no_retry': None,
     })
 
 
@@ -819,8 +831,10 @@ def safe_download_filename(name):
     name = "".join(c for c in name if c >= " " and c != "\x7f")
     name = name.replace("\\", "/").rsplit("/", 1)[-1]
     name = os.path.splitdrive(name)[1].strip()
+    # A leading dot makes the file "hidden" to helpers.is_hidden, so it would
+    # sit in WATCH forever; trailing dots and spaces are invalid on SMB shares.
+    name = name.lstrip(".").rstrip(". ")
     if name in ("", ".", ".."):
-        import uuid
         return f"download_{uuid.uuid4().hex}"
 
     if len(name.encode("utf-8")) > _MAX_DOWNLOAD_NAME_BYTES:
@@ -831,6 +845,12 @@ def safe_download_filename(name):
         base = base.encode("utf-8")[:budget].decode("utf-8", "ignore").rstrip()
         name = (base or "download") + ext
     return name
+
+
+def _stays_in(dl_dir, path):
+    """True when *path* (symlinks resolved) is directly inside *dl_dir*."""
+    return (os.path.dirname(os.path.realpath(path))
+            == os.path.realpath(dl_dir))
 
 
 def claim_download_path(dl_dir, filename):
@@ -859,8 +879,11 @@ def claim_download_path(dl_dir, filename):
     for counter in range(_MAX_CLAIM_CANDIDATES):
         candidate = filename if counter == 0 else f"{base}_{counter}{ext}"
         final_path = os.path.join(dl_dir, candidate)
-        # A completed file of this name is not ours to overwrite.
-        if os.path.exists(final_path):
+        # A completed file of this name is not ours to overwrite. lexists, so
+        # a dangling symlink planted under the name counts as taken too.
+        if os.path.lexists(final_path):
+            continue
+        if not _stays_in(dl_dir, final_path):
             continue
         claim_path = final_path + CLAIM_SUFFIX
         try:
@@ -874,8 +897,9 @@ def claim_download_path(dl_dir, filename):
 
     # Every candidate was taken (or the directory refused us). A unique name
     # beats failing the download outright.
-    import uuid
     final_path = os.path.join(dl_dir, f"{base}_{uuid.uuid4().hex[:8]}{ext}")
+    if not _stays_in(dl_dir, final_path):
+        raise ValueError(f"Download name escapes {dl_dir}: {final_path}")
     claim_path = final_path + CLAIM_SUFFIX
     try:
         os.close(os.open(claim_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644))
@@ -896,3 +920,266 @@ def release_download_claim(claim_path):
         os.remove(claim_path)
     except OSError:
         pass
+
+
+# ---------------------------------------------------------------------------
+# What a download may fetch, and which headers go with it
+# ---------------------------------------------------------------------------
+#
+# POST /download is reachable without a login in implicit-owner mode, and the
+# resolver and downloaders follow redirects. Without these checks a caller could
+# make CLU fetch any LAN or cloud-metadata address and carry the owner's
+# custom_headers there. api.py cannot be imported by the tests, so every
+# decision lives here and api.py only calls it.
+
+class UnsafeURLError(ValueError):
+    """A URL the download pipeline must not fetch."""
+
+
+class UnresolvableHostError(UnsafeURLError):
+    """The host did not resolve. Not fetched -- but possibly a transient DNS
+    failure, so unlike a policy refusal it may be retried."""
+
+
+def is_policy_refusal(error) -> bool:
+    """True for a refusal that will repeat on every attempt (a non-public or
+    malformed URL), so retrying it is pointless. A DNS failure is not one."""
+    return (isinstance(error, UnsafeURLError)
+            and not isinstance(error, UnresolvableHostError))
+
+
+# GetComics' own hosts; comicfiles.ru is its direct download host. The owner's
+# custom_headers (usually access/bypass credentials) go to these and their
+# subdomains only, and only these may be handed to FlareSolverr's browser,
+# which follows redirects and runs page scripts outside every check here.
+GETCOMICS_HOSTS = ("getcomics.org", "comicfiles.ru")
+CUSTOM_HEADER_HOSTS = GETCOMICS_HOSTS
+
+_DEFAULT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/112.0.0.0 Safari/537.36"
+)
+
+_MAX_LINK_LENGTH = 4096
+
+
+def url_host(url) -> str:
+    """The URL's lower-cased host name, or ``''`` when it has none."""
+    try:
+        return (urlsplit(url).hostname or "").lower()
+    except (TypeError, ValueError, AttributeError):
+        return ""
+
+
+def url_host_is(url, *domains) -> bool:
+    """True when the URL's host is one of *domains* or a subdomain of one.
+
+    Not a substring test: ``http://10.0.0.5/?pixeldrain.com`` and
+    ``pixeldrain.com.evil.example`` are not PixelDrain.
+    """
+    host = url_host(url).rstrip(".")
+    if not host:
+        return False
+    return any(host == d or host.endswith("." + d)
+               for d in (d.lower() for d in domains))
+
+
+_NAT64 = ipaddress.ip_network("64:ff9b::/96")
+_IPV4_COMPATIBLE = ipaddress.ip_network("::/96")
+
+
+def _ip_is_public(ip) -> bool:
+    if ip.version == 6:
+        if ip in _IPV4_COMPATIBLE:          # deprecated ::a.b.c.d; also :: and ::1
+            return False
+        if ip in _NAT64:                    # reaches the embedded IPv4 on NAT64 hosts
+            ip = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        else:
+            embedded = ip.ipv4_mapped or ip.sixtofour or (ip.teredo and ip.teredo[1])
+            if embedded is not None:
+                ip = embedded
+    return ip.is_global and not ip.is_multicast
+
+
+def fetch_url(url, location=None):
+    """The URL requests will actually fetch, for checking before it does.
+
+    Joins a redirect/meta-refresh *location* onto *url*, then quotes it the
+    way requests does (a raw space becomes %20, a backslash %5C). A mirror
+    that redirects to ".../Batman 001.cbz" is legitimate; checking the raw
+    string would refuse it as ambiguous.
+    """
+    if location is not None:
+        url = urljoin(url, location)
+    return requote_uri(url) if isinstance(url, str) else url
+
+
+def _normalised_host(host):
+    host = (host or "").strip("[]").lower().rstrip(".")
+    return host.split("%", 1)[0]
+
+
+def assert_public_url(url, *, resolve=True, resolver=None) -> str:
+    """Return *url* unchanged if it may be fetched, else raise UnsafeURLError.
+
+    Only http/https, and only a host whose addresses are all public: one private
+    A record refuses the URL. ``is_global`` covers loopback, RFC 1918,
+    link-local (169.254.169.254), ULA, CGNAT, unspecified and reserved ranges.
+    ``resolve=False`` skips DNS (for the request thread); a literal IP is
+    always checked. The address is resolved again when the request is made, so
+    DNS rebinding is a known residual.
+    """
+    if not isinstance(url, str) or not url:
+        raise UnsafeURLError("URL must be a non-empty string")
+    # urllib.parse and urllib3 (which requests connects through) disagree on
+    # where some authorities end: "http://127.0.0.1\\@example.com/" is
+    # example.com to the former and 127.0.0.1 to the latter. Refuse the
+    # characters that cause it, then insist both parsers name the same host.
+    if "\\" in url or any(ord(c) <= 0x20 or ord(c) == 0x7f for c in url):
+        raise UnsafeURLError("URL contains characters that make its host ambiguous")
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+        connect_host = parse_url(url).host
+    except ValueError as e:     # includes urllib3's LocationParseError
+        raise UnsafeURLError(f"malformed URL: {e}") from None
+    scheme = (parts.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise UnsafeURLError(f"scheme {scheme or '(none)'!r} is not allowed")
+    host = (parts.hostname or "").lower().rstrip(".")
+    if not host:
+        raise UnsafeURLError("URL has no host")
+    if _normalised_host(unquote(host)) != _normalised_host(connect_host):
+        raise UnsafeURLError("URL host is ambiguous")
+    # Check the host urllib3 will connect to ("%31%32%37%2e0.0.1" is 127.0.0.1).
+    host = _normalised_host(connect_host)
+    if host == "localhost" or host.endswith(".localhost"):
+        raise UnsafeURLError(f"host {host} is not public")
+
+    try:
+        literal = ipaddress.ip_address(host)
+    except ValueError:
+        literal = None
+    if literal is not None:
+        if not _ip_is_public(literal):
+            raise UnsafeURLError(f"address {literal} is not public")
+        return url
+    if not resolve:
+        return url
+
+    resolver = resolver or socket.getaddrinfo
+    try:
+        infos = resolver(host, port or (443 if scheme == "https" else 80),
+                         type=socket.SOCK_STREAM)
+    except (OSError, UnicodeError) as e:
+        raise UnresolvableHostError(f"could not resolve host {host}: {e}") from None
+    if not infos:
+        raise UnresolvableHostError(f"could not resolve host {host}")
+    for info in infos:
+        try:
+            ip = ipaddress.ip_address(str(info[4][0]).split("%", 1)[0])
+        except (ValueError, IndexError, TypeError):
+            raise UnsafeURLError(f"host {host} resolved to an unusable address") from None
+        if not _ip_is_public(ip):
+            raise UnsafeURLError(f"host {host} resolves to non-public address {ip}")
+    return url
+
+
+def custom_request_headers() -> dict:
+    """The owner's custom_headers setting, parsed. Read per call.
+
+    Only string-to-string pairs survive. Bad JSON yields ``{}``: a typo in a
+    setting must not fail every download, and it is logged at DEBUG only
+    because this runs once per request.
+    """
+    from core.settings import get_setting
+
+    raw = get_setting("HEADERS")
+    if not raw or not str(raw).strip():
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError) as e:
+        from core.app_logging import app_logger
+        app_logger.debug(f"Ignoring custom headers setting: {e}")
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    return {k.strip(): v.strip() for k, v in parsed.items()
+            if isinstance(k, str) and isinstance(v, str) and k.strip()}
+
+
+def request_headers_for(url, *, internal) -> dict:
+    """Headers for a request to *url*.
+
+    Always the User-Agent; the owner's custom headers only for a link from the
+    browser extension (``internal=False``) to a GetComics host.
+    """
+    hdrs = {"User-Agent": _DEFAULT_USER_AGENT}
+    if not internal and url_host_is(url, *CUSTOM_HEADER_HOSTS):
+        hdrs.update(custom_request_headers())
+    return hdrs
+
+
+def sensitive_custom_headers(sent_headers) -> dict:
+    """The owner's custom headers actually present in *sent_headers*.
+
+    By value, so a header the session set for itself (cloudscraper's
+    User-Agent, the GetComics Referer) is never mistaken for one of ours.
+    """
+    sent = sent_headers or {}
+    return {k: v for k, v in custom_request_headers().items()
+            if sent.get(k) == v and k.lower() not in ("user-agent", "referer")}
+
+
+def harden_session(session, sensitive_headers=None):
+    """Check every redirect a requests/cloudscraper session follows.
+
+    Adds a response hook. requests runs hooks before it builds the next hop, so
+    raising here aborts the chain before an unsafe URL is requested, and
+    removing a header from ``r.request`` keeps it off the next hop.
+    *sensitive_headers* maps name to value (see sensitive_custom_headers); each
+    is dropped once a redirect leaves the GetComics hosts, and only while it
+    still holds that value. Returns the session.
+    """
+    sensitive = dict(sensitive_headers or {})
+
+    def _check_redirect(r, *args, **kwargs):
+        if r.is_redirect:
+            nxt = fetch_url(r.url, r.headers["location"])
+            assert_public_url(nxt)
+            if sensitive and not url_host_is(nxt, *CUSTOM_HEADER_HOSTS):
+                for name, value in sensitive.items():
+                    if r.request.headers.get(name) == value:
+                        r.request.headers.pop(name, None)
+        return r
+
+    session.hooks.setdefault("response", []).append(_check_redirect)
+    return session
+
+
+def parse_download_request(data):
+    """Validate a POST /download body. Returns ``(url, dest_filename)``.
+
+    Raises ValueError with a message fit for a 400. DNS is not consulted here
+    (this runs on the request thread); the worker resolves and checks again.
+    """
+    if not isinstance(data, dict):
+        raise ValueError('Request body must be a JSON object with a "link"')
+    url = data.get("link")
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError('Missing "link" in request data')
+    url = url.strip()
+    if len(url) > _MAX_LINK_LENGTH:
+        raise ValueError('"link" is too long')
+    try:
+        assert_public_url(url, resolve=False)
+    except UnsafeURLError as e:
+        raise ValueError(f"Refused link: {e}") from None
+    dest = data.get("dest_filename")
+    if dest is not None:
+        if not isinstance(dest, str) or len(dest) > 255:
+            raise ValueError('"dest_filename" must be a file name of at most 255 characters')
+        dest = safe_download_filename(dest) if dest.strip() else None
+    return url, dest
